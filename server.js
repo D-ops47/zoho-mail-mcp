@@ -1,87 +1,325 @@
-const express=require('express'),axios=require('axios'),app=express();
+const express = require('express');
+const axios = require('axios');
+const app = express();
 app.use(express.json());
-const CLIENT_ID=process.env.ZOHO_CLIENT_ID,CLIENT_SECRET=process.env.ZOHO_CLIENT_SECRET,REFRESH_TOKEN=process.env.ZOHO_REFRESH_TOKEN;
-let accessToken=null,tokenExpiry=0;
-async function getAccessToken(){if(accessToken&&Date.now()<tokenExpiry-60000)return accessToken;const r=await axios.post('https://accounts.zoho.com/oauth/v2/token',null,{params:{grant_type:'refresh_token',client_id:CLIENT_ID,client_secret:CLIENT_SECRET,refresh_token:REFRESH_TOKEN}});if(!r.data.access_token)throw new Error('Token refresh failed');accessToken=r.data.access_token;tokenExpiry=Date.now()+(r.data.expires_in*1000);console.log('Token refreshed');return accessToken;}
-async function zg(url,p){const t=await getAccessToken();try{const r=await axios.get(url,{headers:{Authorization:`Zoho-oauthtoken ${t}`},params:p});return r.data;}catch(e){throw new Error(`Zoho ${e.response?.status}:${JSON.stringify(e.response?.data||e.message)}`);}}
-const uw=d=>{if(!d)return[];if(Array.isArray(d))return d;if(d.data&&Array.isArray(d.data))return d.data;if(d.data)return[d.data];return[d];};
-app.get('/health',(q,s)=>s.json({status:'ok',service:'zoho-mail-mcp'}));
-app.get('/debug',async(q,s)=>{try{const t=await getAccessToken();const ar=await axios.get('https://mail.zoho.com/api/accounts',{headers:{Authorization:`Zoho-oauthtoken ${t}`}});const ac=uw(ar.data);const aid=ac[0]?.accountId;let ft=null;try{const fr=await axios.get(`https://mail.zoho.com/api/accounts/${aid}/folders`,{headers:{Authorization:`Zoho-oauthtoken ${t}`}});ft={ok:true,count:uw(fr.data).length};}catch(e){ft={err:e.response?.status};}s.json({ok:true,accountId:aid,email:ac[0]?.primaryEmailAddress,folders:ft});}catch(e){s.json({error:e.message});}});
-app.post('/mcp',async(q,s)=>{
-const{method,params,id}=q.body;
-const ok=r=>s.json({jsonrpc:'2.0',id,result:r});
-const er=(c,m)=>s.json({jsonrpc:'2.0',id,error:{code:c,message:m}});
-try{
-if(method==='initialize')return ok({protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'zoho-mail-mcp',version:'1.0.0'}});
-if(method==='tools/list')return ok({tools:[
-  {name:'list_accounts',description:'List all Zoho Mail accounts',inputSchema:{type:'object',properties:{}}},
-  {name:'list_folders',description:'List folders in a Zoho Mail account',inputSchema:{type:'object',properties:{accountId:{type:'string'}},required:['accountId']}},
-  {name:'list_emails',description:'List emails in a folder (use list_folders first to get folderId)',inputSchema:{type:'object',properties:{accountId:{type:'string'},folderId:{type:'string'},limit:{type:'number'},start:{type:'number'}},required:['accountId','folderId']}},
-  {name:'search_emails',description:'Search emails by keyword across all folders',inputSchema:{type:'object',properties:{accountId:{type:'string'},query:{type:'string'},limit:{type:'number'}},required:['accountId','query']}},
-  {name:'get_email',description:'Get full body and content of an email (also returns attachments list)',inputSchema:{type:'object',properties:{accountId:{type:'string'},messageId:{type:'string'},folderId:{type:'string',description:'Optional: folder ID to fetch from. Use Inbox folder ID if known.'}},required:['accountId','messageId']}},
-  {name:'list_attachments',description:'List attachments on an email',inputSchema:{type:'object',properties:{accountId:{type:'string'},messageId:{type:'string'},folderId:{type:'string'}},required:['accountId','messageId']}},
-  {name:'get_attachment',description:'Download attachment content - extracts text from PDFs and Word docs',inputSchema:{type:'object',properties:{accountId:{type:'string'},messageId:{type:'string'},attachmentId:{type:'string'}},required:['accountId','messageId','attachmentId']}}
-]});
-if(method==='tools/call'){
-  const{name,arguments:a}=params;
-  if(name==='list_accounts'){const d=await zg('https://mail.zoho.com/api/accounts');return ok({content:[{type:'text',text:JSON.stringify(uw(d).map(x=>({id:x.accountId,email:x.primaryEmailAddress||x.incomingUserName,name:x.displayName||x.accountDisplayName,primary:x.isDefaultAccount})),null,2)}]});}
-  if(name==='list_folders'){const d=await zg(`https://mail.zoho.com/api/accounts/${a.accountId}/folders`);return ok({content:[{type:'text',text:JSON.stringify(uw(d).map(f=>({id:f.folderId,name:f.folderName,path:f.path||f.folderPath,unread:f.unreadCount,total:f.messageCount})),null,2)}]});}
-  if(name==='list_emails'){const d=await zg(`https://mail.zoho.com/api/accounts/${a.accountId}/messages/view`,{folderId:a.folderId,limit:a.limit||20,start:a.start||1});return ok({content:[{type:'text',text:JSON.stringify(uw(d).map(m=>({id:m.messageId,subject:m.subject,from:m.fromAddress||m.sender,to:m.toAddress,date:m.receivedTime||m.sentTime,hasAttachment:m.hasAttachment,summary:m.summary})),null,2)}]});}
-  if(name==='search_emails'){
-    try{const d=await zg(`https://mail.zoho.com/api/accounts/${a.accountId}/messages/search`,{searchKey:a.query});return ok({content:[{type:'text',text:JSON.stringify(uw(d).map(m=>({id:m.messageId,subject:m.subject,from:m.fromAddress||m.sender,date:m.receivedTime||m.sentTime,summary:m.summary})),null,2)}]});}
-    catch(e){if(e.message.includes('Index')&&e.message.includes('out of bounds'))return ok({content:[{type:'text',text:'[]'}]});throw e;}
-  }
-  if(name==='get_email'||name==='list_attachments'){
-    // Fetch message - try multiple approaches
-    let msg=null,msgErr=null;
-    // Approach 1: use view endpoint with messageId param (works with or without folderId)
-    const params1={messageId:a.messageId};
-    if(a.folderId)params1.folderId=a.folderId;
-    try{const d=await zg(`https://mail.zoho.com/api/accounts/${a.accountId}/messages/view`,params1);const items=uw(d);const found=items.find(m=>m.messageId===a.messageId)||items[0];if(found)msg=found;}catch(e1){msgErr=e1.message;}
-    // Approach 2: messagecontent endpoint
-    if(!msg){try{const d=await zg(`https://mail.zoho.com/api/accounts/${a.accountId}/messages/${a.messageId}/messagecontent`);msg=d.data||d;}catch(e2){}}
-    if(name==='get_email'){
-      if(!msg)throw new Error('Could not fetch email: '+msgErr);
-      return ok({content:[{type:'text',text:JSON.stringify(msg,null,2)}]});
+
+// Zoho credentials (set as Railway environment variables)
+const CLIENT_ID     = process.env.ZOHO_CLIENT_ID;
+const CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
+const REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
+
+let accessToken = null;
+let tokenExpiry = 0;
+
+// Auto token refresh
+async function getAccessToken() {
+  if (accessToken && Date.now() < tokenExpiry - 60000) return accessToken;
+  const res = await axios.post('https://accounts.zoho.com/oauth/v2/token', null, {
+    params: {
+      grant_type:    'refresh_token',
+      client_id:     CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      refresh_token: REFRESH_TOKEN
     }
-    // list_attachments
-    const att=(msg?.attachments||msg?.attachment||[]).map(x=>({id:x.attachmentId||x.id,name:x.attachmentName||x.name,size:x.attachmentSize||x.size,contentType:x.attachmentType||x.mimeType}));
-    return ok({content:[{type:'text',text:JSON.stringify(att,null,2)}]});
-  }
-  if(name==='get_attachment'){
-    const t=await getAccessToken();
-    const url=`https://mail.zoho.com/api/accounts/${a.accountId}/messages/${a.messageId}/attachment/${a.attachmentId}`;
-    const r2=await axios.get(url,{headers:{Authorization:`Zoho-oauthtoken ${t}`},responseType:'arraybuffer'});
-    const ct=(r2.headers['content-type']||'').toLowerCase(),buf=Buffer.from(r2.data);
-    if(ct.includes('pdf')){try{const p=require('pdf-parse');const x=await p(buf);return ok({content:[{type:'text',text:`PDF (${x.numpages} pages):\n${x.text}`}]});}catch(e){return ok({content:[{type:'text',text:`PDF error:${e.message}`}]});}}
-    if(ct.includes('word')||ct.includes('officedocument')){try{const m=require('mammoth');const r=await m.extractRawText({buffer:buf});return ok({content:[{type:'text',text:`Doc:\n${r.value}`}]});}catch(e){return ok({content:[{type:'text',text:`Word error:${e.message}`}]});}}
-    if(ct.includes('text/'))return ok({content:[{type:'text',text:buf.toString('utf-8')}]});
-    return ok({content:[{type:'text',text:`Binary:${buf.length}b type:${ct}`}]});
-  }
-  return er(-32601,`Unknown tool:${name}`);
+  });
+  accessToken = res.data.access_token;
+  tokenExpiry = Date.now() + (res.data.expires_in * 1000);
+  return accessToken;
 }
-if(method==='notifications/initialized')return s.status(204).end();
-return er(-32601,`Method not found:${method}`);
-}catch(e){console.error('MCP:',e.message);return er(-32000,e.message);}
+
+async function zohoGet(url, params = {}) {
+  const token = await getAccessToken();
+  const res = await axios.get(url, {
+    headers: { Authorization: `Zoho-oauthtoken ${token}` },
+    params
+  });
+  return res.data;
+}
+
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'zoho-mail-mcp' }));
+
+app.post('/mcp', async (req, res) => {
+  const { method, params, id } = req.body;
+  const ok  = (result) => res.json({ jsonrpc: '2.0', id, result });
+  const err = (code, message) => res.json({ jsonrpc: '2.0', id, error: { code, message } });
+
+  try {
+    if (method === 'initialize') {
+      return ok({
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'zoho-mail-mcp', version: '1.1.0' }
+      });
+    }
+
+    if (method === 'tools/list') {
+      return ok({ tools: [
+        {
+          name: 'list_accounts',
+          description: 'List all Zoho Mail accounts',
+          inputSchema: { type: 'object', properties: {} }
+        },
+        {
+          name: 'list_folders',
+          description: 'List folders in a Zoho Mail account',
+          inputSchema: {
+            type: 'object',
+            properties: { accountId: { type: 'string', description: 'Account ID from list_accounts' } },
+            required: ['accountId']
+          }
+        },
+        {
+          name: 'list_emails',
+          description: 'List emails in a folder',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              accountId: { type: 'string', description: 'Account ID from list_accounts' },
+              folderId:  { type: 'string', description: 'Folder ID from list_folders' },
+              limit:     { type: 'number', description: 'Max emails to return (default 20)' },
+              start:     { type: 'number', description: 'Pagination start index (default 1)' }
+            },
+            required: ['accountId', 'folderId']
+          }
+        },
+        {
+          name: 'search_emails',
+          description: 'Search emails across all folders',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              accountId: { type: 'string', description: 'Account ID from list_accounts' },
+              query:     { type: 'string', description: 'Search keyword or phrase' },
+              limit:     { type: 'number', description: 'Max results to return (default 20)' }
+            },
+            required: ['accountId', 'query']
+          }
+        },
+        {
+          name: 'get_email',
+          description: 'Get full body content of a specific email. Requires folderId — get it from list_folders or from the folderId field returned by list_emails/search_emails.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              accountId: { type: 'string', description: 'Account ID from list_accounts' },
+              folderId:  { type: 'string', description: 'Folder ID the email lives in (from list_folders)' },
+              messageId: { type: 'string', description: 'Message ID from list_emails or search_emails' }
+            },
+            required: ['accountId', 'folderId', 'messageId']
+          }
+        },
+        {
+          name: 'list_attachments',
+          description: 'List attachments on an email. Requires folderId.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              accountId: { type: 'string', description: 'Account ID from list_accounts' },
+              folderId:  { type: 'string', description: 'Folder ID the email lives in' },
+              messageId: { type: 'string', description: 'Message ID from list_emails or search_emails' }
+            },
+            required: ['accountId', 'folderId', 'messageId']
+          }
+        },
+        {
+          name: 'get_attachment',
+          description: 'Download and read an attachment (PDFs and Word docs extracted as text). Requires folderId.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              accountId:    { type: 'string', description: 'Account ID from list_accounts' },
+              folderId:     { type: 'string', description: 'Folder ID the email lives in' },
+              messageId:    { type: 'string', description: 'Message ID from list_emails or search_emails' },
+              attachmentId: { type: 'string', description: 'Attachment ID from list_attachments' }
+            },
+            required: ['accountId', 'folderId', 'messageId', 'attachmentId']
+          }
+        }
+      ]});
+    }
+
+    if (method === 'tools/call') {
+      const { name, arguments: args } = params;
+
+      // ── list_accounts ──────────────────────────────────────────────────────
+      if (name === 'list_accounts') {
+        const data = await zohoGet('https://mail.zoho.com/api/accounts');
+        const accounts = (data.data || []).map(a => ({
+          id:      a.accountId,
+          email:   a.emailAddress,
+          name:    a.displayName,
+          primary: a.primaryAccount
+        }));
+        return ok({ content: [{ type: 'text', text: JSON.stringify(accounts, null, 2) }] });
+      }
+
+      // ── list_folders ───────────────────────────────────────────────────────
+      if (name === 'list_folders') {
+        const data = await zohoGet(`https://mail.zoho.com/api/accounts/${args.accountId}/folders`);
+        const folders = (data.data || []).map(f => ({
+          id:     f.folderId,
+          name:   f.folderName,
+          path:   f.folderPath,
+          unread: f.unreadCount,
+          total:  f.messageCount
+        }));
+        return ok({ content: [{ type: 'text', text: JSON.stringify(folders, null, 2) }] });
+      }
+
+      // ── list_emails ────────────────────────────────────────────────────────
+      if (name === 'list_emails') {
+        const data = await zohoGet(
+          `https://mail.zoho.com/api/accounts/${args.accountId}/messages/view`,
+          { folderId: args.folderId, limit: args.limit || 20, start: args.start || 1 }
+        );
+        const emails = (data.data || []).map(m => ({
+          id:            m.messageId,
+          subject:       m.subject,
+          from:          m.fromAddress,
+          to:            m.toAddress,
+          date:          m.receivedTime,
+          folderId:      m.folderId,
+          hasAttachment: m.hasAttachment,
+          summary:       m.summary
+        }));
+        return ok({ content: [{ type: 'text', text: JSON.stringify(emails, null, 2) }] });
+      }
+
+      // ── search_emails ──────────────────────────────────────────────────────
+      if (name === 'search_emails') {
+        const data = await zohoGet(
+          `https://mail.zoho.com/api/accounts/${args.accountId}/messages/search`,
+          { searchKey: args.query, limit: args.limit || 20 }
+        );
+        const emails = (data.data || []).map(m => ({
+          id:       m.messageId,
+          subject:  m.subject,
+          from:     m.fromAddress,
+          date:     m.receivedTime,
+          folderId: m.folderId,
+          summary:  m.summary
+        }));
+        return ok({ content: [{ type: 'text', text: JSON.stringify(emails, null, 2) }] });
+      }
+
+      // ── get_email ──────────────────────────────────────────────────────────
+      // FIX: correct endpoint requires folderId in the path
+      // Correct: /api/accounts/{accountId}/folders/{folderId}/messages/{messageId}/content
+      if (name === 'get_email') {
+        if (!args.folderId) {
+          return err(-32602, 'folderId is required. Get it from list_folders or from the folderId field in list_emails/search_emails results.');
+        }
+        let data;
+        try {
+          data = await zohoGet(
+            `https://mail.zoho.com/api/accounts/${args.accountId}/folders/${args.folderId}/messages/${args.messageId}/content`
+          );
+        } catch (e) {
+          return err(-32000, `Could not fetch email: ${e.response ? 'Zoho ' + e.response.status + ':' + JSON.stringify(e.response.data) : e.message}`);
+        }
+
+        // Strip HTML tags from content for cleaner AI reading, keep plain text fallback
+        const raw = data.data || data;
+        let bodyText = '';
+        if (raw.content) {
+          // Remove HTML tags
+          bodyText = raw.content.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        }
+
+        const result = {
+          messageId: raw.messageId,
+          subject:   raw.subject,
+          from:      raw.fromAddress || raw.from,
+          to:        raw.toAddress || raw.to,
+          date:      raw.receivedTime || raw.date,
+          body:      bodyText || JSON.stringify(raw)
+        };
+        return ok({ content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
+      }
+
+      // ── list_attachments ───────────────────────────────────────────────────
+      // FIX: correct endpoint requires folderId in the path
+      // Correct: /api/accounts/{accountId}/folders/{folderId}/messages/{messageId}/attachmentinfo
+      if (name === 'list_attachments') {
+        if (!args.folderId) {
+          return err(-32602, 'folderId is required. Get it from list_folders or from the folderId field in list_emails/search_emails results.');
+        }
+        let data;
+        try {
+          data = await zohoGet(
+            `https://mail.zoho.com/api/accounts/${args.accountId}/folders/${args.folderId}/messages/${args.messageId}/attachmentinfo`
+          );
+        } catch (e) {
+          return err(-32000, `Could not list attachments: ${e.response ? 'Zoho ' + e.response.status + ':' + JSON.stringify(e.response.data) : e.message}`);
+        }
+        const attachments = (data.data || []).map(a => ({
+          id:          a.attachmentId,
+          name:        a.attachmentName,
+          size:        a.attachmentSize,
+          contentType: a.attachmentType
+        }));
+        return ok({ content: [{ type: 'text', text: JSON.stringify(attachments, null, 2) }] });
+      }
+
+      // ── get_attachment ─────────────────────────────────────────────────────
+      // FIX: correct endpoint requires folderId in the path
+      // Correct: /api/accounts/{accountId}/folders/{folderId}/messages/{messageId}/attachments/{attachmentId}
+      if (name === 'get_attachment') {
+        if (!args.folderId) {
+          return err(-32602, 'folderId is required. Get it from list_folders or from the folderId field in list_emails/search_emails results.');
+        }
+        const token = await getAccessToken();
+        const url = `https://mail.zoho.com/api/accounts/${args.accountId}/folders/${args.folderId}/messages/${args.messageId}/attachments/${args.attachmentId}`;
+        let res2;
+        try {
+          res2 = await axios.get(url, {
+            headers: { Authorization: `Zoho-oauthtoken ${token}` },
+            responseType: 'arraybuffer'
+          });
+        } catch (e) {
+          return err(-32000, `Could not fetch attachment: ${e.response ? 'Zoho ' + e.response.status + ':' + JSON.stringify(e.response.data) : e.message}`);
+        }
+        const contentType = res2.headers['content-type'] || '';
+        const buffer = Buffer.from(res2.data);
+
+        if (contentType.includes('pdf')) {
+          try {
+            const pdfParse = require('pdf-parse');
+            const parsed = await pdfParse(buffer);
+            return ok({ content: [{ type: 'text', text: `PDF Text Content:\n${parsed.text}` }] });
+          } catch (e) {
+            return ok({ content: [{ type: 'text', text: `PDF parse error: ${e.message}` }] });
+          }
+        }
+
+        if (contentType.includes('word') || contentType.includes('officedocument')) {
+          try {
+            const mammoth = require('mammoth');
+            const result = await mammoth.extractRawText({ buffer });
+            return ok({ content: [{ type: 'text', text: `Document Text:\n${result.value}` }] });
+          } catch (e) {
+            return ok({ content: [{ type: 'text', text: `Word parse error: ${e.message}` }] });
+          }
+        }
+
+        if (contentType.includes('text')) {
+          return ok({ content: [{ type: 'text', text: buffer.toString('utf-8') }] });
+        }
+
+        return ok({ content: [{ type: 'text', text: `Binary attachment, size: ${buffer.length} bytes, type: ${contentType}` }] });
+      }
+
+      return err(-32601, `Unknown tool: ${name}`);
+    }
+
+    if (method === 'notifications/initialized') return res.status(204).end();
+    return err(-32601, `Method not found: ${method}`);
+
+  } catch (e) {
+    console.error('MCP error:', e.message);
+    return err(-32603, e.message);
+  }
 });
 
-app.get('/raw-msg',async(q,s)=>{
-  try{
-    const{accountId,messageId,folderId}=q.query;
-    const t=await getAccessToken();
-    const h={Authorization:`Zoho-oauthtoken ${t}`};
-    const results={};
-    const urls=[
-      `https://mail.zoho.com/api/accounts/${accountId}/messages/${messageId}`,
-      `https://mail.zoho.com/api/accounts/${accountId}/messages/${messageId}/messagecontent`,
-      `https://mail.zoho.com/api/accounts/${accountId}/messages/${messageId}/content`,
-      `https://mail.zoho.com/api/accounts/${accountId}/messages/view/${messageId}`
-    ];
-    for(const url of urls){
-      try{const r=await axios.get(url,{headers:h});results[url]={status:r.status,keys:Object.keys(r.data||{}),sample:JSON.stringify(r.data).substring(0,200)};}
-      catch(e){results[url]={err:e.response?.status,body:JSON.stringify(e.response?.data).substring(0,150)};}
-    }
-    s.json(results);
-  }catch(e){s.json({error:e.message});}
-});
-app.listen(process.env.PORT||3000,()=>console.log('Zoho Mail MCP running'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.1.0 running on port ${PORT}`));
