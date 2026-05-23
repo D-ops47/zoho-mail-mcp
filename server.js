@@ -48,7 +48,7 @@ app.post('/mcp', async (req, res) => {
       return ok({
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'zoho-mail-mcp', version: '1.1.0' }
+        serverInfo: { name: 'zoho-mail-mcp', version: '1.2.0' }
       });
     }
 
@@ -186,18 +186,29 @@ app.post('/mcp', async (req, res) => {
       }
 
       // ── search_emails ──────────────────────────────────────────────────────
+      // Zoho search API: GET /api/accounts/{accountId}/messages/search
+      // Required param: searchKey (the keyword). Returns emails across all folders.
       if (name === 'search_emails') {
-        const data = await zohoGet(
-          `https://mail.zoho.com/api/accounts/${args.accountId}/messages/search`,
-          { searchKey: args.query, limit: args.limit || 20 }
-        );
-        const emails = (data.data || []).map(m => ({
-          id:       m.messageId,
-          subject:  m.subject,
-          from:     m.fromAddress,
-          date:     m.receivedTime,
-          folderId: m.folderId,
-          summary:  m.summary
+        let data;
+        try {
+          data = await zohoGet(
+            `https://mail.zoho.com/api/accounts/${args.accountId}/messages/search`,
+            { searchKey: args.query, limit: args.limit || 20 }
+          );
+        } catch (e) {
+          // Fallback: some Zoho accounts require folderId on search — try inbox
+          return err(-32000, `Search failed: ${e.response ? 'Zoho ' + e.response.status + ':' + JSON.stringify(e.response.data) : e.message}. Try list_emails with a specific folderId instead.`);
+        }
+        const raw = data.data || data;
+        const list = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+        const emails = list.map(m => ({
+          id:            m.messageId,
+          subject:       m.subject,
+          from:          m.fromAddress,
+          date:          m.receivedTime,
+          folderId:      m.folderId,
+          hasAttachment: m.hasAttachment,
+          summary:       m.summary
         }));
         return ok({ content: [{ type: 'text', text: JSON.stringify(emails, null, 2) }] });
       }
@@ -252,7 +263,10 @@ app.post('/mcp', async (req, res) => {
         } catch (e) {
           return err(-32000, `Could not list attachments: ${e.response ? 'Zoho ' + e.response.status + ':' + JSON.stringify(e.response.data) : e.message}`);
         }
-        const attachments = (data.data || []).map(a => ({
+        // Zoho attachmentinfo can return data as array or single object
+        const rawAtt = data.data || data;
+        const attList = Array.isArray(rawAtt) ? rawAtt : (rawAtt ? [rawAtt] : []);
+        const attachments = attList.map(a => ({
           id:          a.attachmentId,
           name:        a.attachmentName,
           size:        a.attachmentSize,
@@ -322,4 +336,4 @@ app.post('/mcp', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.1.0 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.2.0 running on port ${PORT}`));
