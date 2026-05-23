@@ -38,6 +38,26 @@ async function zohoGet(url, params = {}) {
 
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'zoho-mail-mcp' }));
 
+// Temporary raw debug endpoint - inspect Zoho API responses
+app.get('/raw-debug', async (req, res) => {
+  try {
+    const { accountId, folderId, messageId, type } = req.query;
+    let url, params = {};
+    if (type === 'attachmentinfo') {
+      url = `https://mail.zoho.com/api/accounts/${accountId}/folders/${folderId}/messages/${messageId}/attachmentinfo`;
+    } else if (type === 'search') {
+      url = `https://mail.zoho.com/api/accounts/${accountId}/messages/search`;
+      params = { searchKey: req.query.q || 'loan', limit: 3 };
+    } else {
+      return res.json({ error: 'type must be attachmentinfo or search' });
+    }
+    const data = await zohoGet(url, params);
+    res.json({ url, params, raw: data });
+  } catch (e) {
+    res.json({ error: e.message, response: e.response?.data });
+  }
+});
+
 app.post('/mcp', async (req, res) => {
   const { method, params, id } = req.body;
   const ok  = (result) => res.json({ jsonrpc: '2.0', id, result });
