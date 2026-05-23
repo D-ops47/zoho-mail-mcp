@@ -64,4 +64,24 @@ if(method==='notifications/initialized')return s.status(204).end();
 return er(-32601,`Method not found:${method}`);
 }catch(e){console.error('MCP:',e.message);return er(-32000,e.message);}
 });
+
+app.get('/raw-msg',async(q,s)=>{
+  try{
+    const{accountId,messageId,folderId}=q.query;
+    const t=await getAccessToken();
+    const h={Authorization:`Zoho-oauthtoken ${t}`};
+    const results={};
+    const urls=[
+      `https://mail.zoho.com/api/accounts/${accountId}/messages/${messageId}`,
+      `https://mail.zoho.com/api/accounts/${accountId}/messages/${messageId}/messagecontent`,
+      `https://mail.zoho.com/api/accounts/${accountId}/messages/${messageId}/content`,
+      `https://mail.zoho.com/api/accounts/${accountId}/messages/view/${messageId}`
+    ];
+    for(const url of urls){
+      try{const r=await axios.get(url,{headers:h});results[url]={status:r.status,keys:Object.keys(r.data||{}),sample:JSON.stringify(r.data).substring(0,200)};}
+      catch(e){results[url]={err:e.response?.status,body:JSON.stringify(e.response?.data).substring(0,150)};}
+    }
+    s.json(results);
+  }catch(e){s.json({error:e.message});}
+});
 app.listen(process.env.PORT||3000,()=>console.log('Zoho Mail MCP running'));
