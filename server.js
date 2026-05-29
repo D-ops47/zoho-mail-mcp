@@ -412,8 +412,11 @@ app.post('/mcp', async (req, res) => {
     return err(-32601, `Method not found: ${method}`);
 
   } catch (e) {
-    console.error('MCP error:', e.message);
-    return err(-32603, e.message);
+    // Include full Zoho response body in error for debugging
+    const zohoBody = e.response?.data ? JSON.stringify(e.response.data) : '';
+    const detail = zohoBody ? `${e.message} — Zoho: ${zohoBody}` : e.message;
+    console.error('MCP error:', detail);
+    return err(-32603, detail);
   }
 });
 
