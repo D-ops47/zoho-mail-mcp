@@ -381,5 +381,37 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
+// TEMP: test native search with entire: prefix syntax (Claude v1.4.3 review)
+app.get('/test-native-search', async (req, res) => {
+  const query = req.query.q || 'title';
+  const accountId = req.query.accountId || '4442947000000008002';
+  const searchKey = query.includes(':') ? query : `entire:${query}`;
+  try {
+    const token = await getAccessToken();
+    const axios2 = require('axios');
+    const result = await axios2.get(
+      `https://mail.zoho.com/api/accounts/${accountId}/messages/search`,
+      {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+        params: { searchKey, limit: 5, start: 1 }
+      }
+    );
+    return res.json({
+      searchKey,
+      status: result.status,
+      zohoStatus: result.data?.status,
+      count: Array.isArray(result.data?.data) ? result.data.data.length : 'non-array',
+      firstSubject: result.data?.data?.[0]?.subject || null,
+      rawData: result.data
+    });
+  } catch (e) {
+    return res.json({
+      searchKey,
+      error: e.message,
+      zohoError: e.response?.data || null
+    });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.4.3 running on port ${PORT}`));
