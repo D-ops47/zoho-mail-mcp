@@ -36,7 +36,7 @@ async function zohoGet(url, params = {}) {
   return res.data;
 }
 
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'zoho-mail-mcp', version: '1.4.3' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'zoho-mail-mcp', version: '1.5.0' }));
 
 app.post('/mcp', async (req, res) => {
   const { method, params, id } = req.body;
@@ -48,7 +48,7 @@ app.post('/mcp', async (req, res) => {
       return ok({
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'zoho-mail-mcp', version: '1.4.3' }
+        serverInfo: { name: 'zoho-mail-mcp', version: '1.5.0' }
       });
     }
 
@@ -188,20 +188,21 @@ app.post('/mcp', async (req, res) => {
       }
 
       // ── search_emails ──────────────────────────────────────────────────────
-      // Implementation: folder-loop scan (Zoho /messages/search returns 400 for this account).
-      // Fetches up to MSGS_PER_FOLDER messages from every folder, filters client-side by keyword.
-      // Supports:
-      //   - limit: max results to return (default 50, max 200 per single call)
-      //   - sweep: true = scan ALL folders with up to SWEEP_CAP total results
-      //   - start: 1-indexed offset for single-page pagination (non-sweep mode only)
-      //   - Results sorted newest-first by date
+      // PRIMARY: Zoho native /messages/search (full-body, true cross-folder, all Zoho operators).
+      //   - Bare queries are auto-prefixed with 'entire:' (Zoho requires 'param:value' syntax).
+      //   - Supports start/limit pagination and sweep:true for full-mailbox collection.
+      // FALLBACK: folder-loop scan if native returns non-200 (metadata+snippet only).
       if (name === 'search_emails') {
-        const SWEEP_CAP       = 2000;  // hard ceiling for sweep mode
-        const MSGS_PER_FOLDER = 200;   // messages fetched per folder per pass
-        const userLimit       = Math.min(args.limit || 50, 200);
-        const sweep           = args.sweep === true;
-        const startOffset     = Math.max((args.start || 1) - 1, 0);  // convert 1-indexed to 0-indexed
-        const q               = (args.query || '').toLowerCase();
+        const SWEEP_CAP   = 2000;  // hard ceiling for sweep mode
+        const PAGE_SIZE   = 200;   // Zoho's per-call maximum for native search
+        const userLimit   = Math.min(args.limit || 50, PAGE_SIZE);
+        const sweep       = args.sweep === true;
+        const startOffset = Math.max((args.start || 1) - 1, 0);  // 1-indexed to 0-indexed
+
+        // Auto-prefix bare queries with 'entire:' — Zoho requires 'param:value' syntax.
+        // If query already contains a Zoho operator (has ':'), pass it through untouched.
+        const rawQuery  = args.query || '';
+        const searchKey = rawQuery.includes(':') ? rawQuery : `entire:${rawQuery}`;
 
         // Map a raw Zoho message object to our standard envelope
         const mapMsg = m => ({
@@ -215,15 +216,79 @@ app.post('/mcp', async (req, res) => {
           summary:       m.summary
         });
 
-        // Get all folders
+        // ── Helper: fetch one page from native search with 429 retry ─────────────────────
+        const nativePage = async (start) => {
+          const MAX_RETRIES = 3;
+          for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            try {
+              return await zohoGet(
+                `https://mail.zoho.com/api/accounts/${args.accountId}/messages/search`,
+                { searchKey, start, limit: PAGE_SIZE }
+              );
+            } catch (e) {
+              if (e.response?.status === 429 && attempt < MAX_RETRIES - 1) {
+                await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+              } else {
+                throw e;
+              }
+            }
+          }
+        };
+
+        // ── Try native search ──────────────────────────────────────────────────────
+        let nativeWorked = false;
+        let allResults   = [];
+        let truncated    = false;
+
+        try {
+          if (!sweep) {
+            // Single-page native search
+            const data = await nativePage(args.start || 1);
+            const raw  = data.data || data;
+            const list = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+            const mapped = list.map(mapMsg);
+            mapped.sort((a, b) => Number(b.date) - Number(a.date));
+            truncated = list.length >= userLimit;
+            return ok({ content: [{ type: 'text', text: JSON.stringify({ total: mapped.length, truncated, results: mapped, source: 'native' }, null, 2) }] });
+          }
+
+          // Sweep: page through all native results
+          let cursor = 1;
+          while (true) {
+            const data = await nativePage(cursor);
+            const raw  = data.data || data;
+            const page = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+            if (page.length === 0) break;
+            allResults = allResults.concat(page.map(mapMsg));
+            cursor += PAGE_SIZE;
+            if (allResults.length > SWEEP_CAP) {
+              truncated  = true;
+              allResults = allResults.slice(0, SWEEP_CAP);
+              break;
+            }
+            if (page.length < PAGE_SIZE) break;
+          }
+          nativeWorked = true;
+        } catch (nativeErr) {
+          // Native search failed — fall through to folder-loop
+          console.error('Native search failed, falling back to folder-loop:', nativeErr.message);
+        }
+
+        if (nativeWorked) {
+          allResults.sort((a, b) => Number(b.date) - Number(a.date));
+          return ok({ content: [{ type: 'text', text: JSON.stringify({ total: allResults.length, truncated, results: allResults, source: 'native' }, null, 2) }] });
+        }
+
+        // ── Fallback: folder-loop scan (metadata + snippet only) ────────────────────────
+        const MSGS_PER_FOLDER = 200;
+        const q = rawQuery.toLowerCase();
         const foldersData = await zohoGet(`https://mail.zoho.com/api/accounts/${args.accountId}/folders`);
         const folders = foldersData.data || [];
-
-        let allMatches = [];
-        const cap = sweep ? SWEEP_CAP : userLimit + startOffset + 200; // collect enough to paginate
+        let fallbackMatches = [];
+        const cap = sweep ? SWEEP_CAP : userLimit + startOffset + 200;
 
         for (const folder of folders) {
-          if (allMatches.length >= cap) break;
+          if (fallbackMatches.length >= cap) break;
           try {
             const fd = await zohoGet(
               `https://mail.zoho.com/api/accounts/${args.accountId}/messages/view`,
@@ -231,33 +296,24 @@ app.post('/mcp', async (req, res) => {
             );
             const msgs = fd.data || [];
             for (const m of msgs) {
-              if (allMatches.length >= cap) break;
+              if (fallbackMatches.length >= cap) break;
               const haystack = `${m.subject||''} ${m.fromAddress||''} ${m.toAddress||''} ${m.summary||''}`.toLowerCase();
-              if (haystack.includes(q)) {
-                allMatches.push(mapMsg(m));
-              }
+              if (haystack.includes(q)) fallbackMatches.push(mapMsg(m));
             }
           } catch (_) { /* skip inaccessible folders */ }
         }
 
-        // Sort all matches newest-first
-        allMatches.sort((a, b) => Number(b.date) - Number(a.date));
-
-        let truncated = false;
-        let results;
-
+        fallbackMatches.sort((a, b) => Number(b.date) - Number(a.date));
+        let fbResults;
         if (sweep) {
-          // Sweep: return up to SWEEP_CAP, flag if cut
-          truncated = allMatches.length > SWEEP_CAP;
-          results = allMatches.slice(0, SWEEP_CAP);
+          truncated = fallbackMatches.length > SWEEP_CAP;
+          fbResults = fallbackMatches.slice(0, SWEEP_CAP);
         } else {
-          // Single-page: apply start offset and limit
-          const page = allMatches.slice(startOffset, startOffset + userLimit);
-          truncated = allMatches.length > startOffset + userLimit;
-          results = page;
+          const page = fallbackMatches.slice(startOffset, startOffset + userLimit);
+          truncated = fallbackMatches.length > startOffset + userLimit;
+          fbResults = page;
         }
-
-        return ok({ content: [{ type: 'text', text: JSON.stringify({ total: results.length, truncated, results }, null, 2) }] });
+        return ok({ content: [{ type: 'text', text: JSON.stringify({ total: fbResults.length, truncated, results: fbResults, source: 'folder-loop-fallback' }, null, 2) }] });
       }
 
       // ── get_email ──────────────────────────────────────────────────────────
@@ -381,37 +437,6 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
-// TEMP: test native search with entire: prefix syntax (Claude v1.4.3 review)
-app.get('/test-native-search', async (req, res) => {
-  const query = req.query.q || 'title';
-  const accountId = req.query.accountId || '4442947000000008002';
-  const searchKey = query.includes(':') ? query : `entire:${query}`;
-  try {
-    const token = await getAccessToken();
-    const axios2 = require('axios');
-    const result = await axios2.get(
-      `https://mail.zoho.com/api/accounts/${accountId}/messages/search`,
-      {
-        headers: { Authorization: `Zoho-oauthtoken ${token}` },
-        params: { searchKey, limit: 5, start: 1 }
-      }
-    );
-    return res.json({
-      searchKey,
-      status: result.status,
-      zohoStatus: result.data?.status,
-      count: Array.isArray(result.data?.data) ? result.data.data.length : 'non-array',
-      firstSubject: result.data?.data?.[0]?.subject || null,
-      rawData: result.data
-    });
-  } catch (e) {
-    return res.json({
-      searchKey,
-      error: e.message,
-      zohoError: e.response?.data || null
-    });
-  }
-});
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.4.3 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.5.0 running on port ${PORT}`));
