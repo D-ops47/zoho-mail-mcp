@@ -419,4 +419,3 @@ app.post('/mcp', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.4.1 running on port ${PORT}`));
-// v1.4.2-redeploy Fri May 29 07:27:12 UTC 2026
