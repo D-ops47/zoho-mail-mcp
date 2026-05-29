@@ -36,7 +36,7 @@ async function zohoGet(url, params = {}) {
   return res.data;
 }
 
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'zoho-mail-mcp', version: '1.4.1' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'zoho-mail-mcp', version: '1.4.2' }));
 
 app.post('/mcp', async (req, res) => {
   const { method, params, id } = req.body;
@@ -48,7 +48,7 @@ app.post('/mcp', async (req, res) => {
       return ok({
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'zoho-mail-mcp', version: '1.4.1' }
+        serverInfo: { name: 'zoho-mail-mcp', version: '1.4.2' }
       });
     }
 
@@ -418,4 +418,4 @@ app.post('/mcp', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.4.1 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.4.2 running on port ${PORT}`));
