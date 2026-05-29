@@ -36,27 +36,7 @@ async function zohoGet(url, params = {}) {
   return res.data;
 }
 
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'zoho-mail-mcp' }));
-
-// Temporary raw debug endpoint - inspect Zoho API responses
-app.get('/raw-debug', async (req, res) => {
-  try {
-    const { accountId, folderId, messageId, type } = req.query;
-    let url, params = {};
-    if (type === 'attachmentinfo') {
-      url = `https://mail.zoho.com/api/accounts/${accountId}/folders/${folderId}/messages/${messageId}/attachmentinfo`;
-    } else if (type === 'search') {
-      url = `https://mail.zoho.com/api/accounts/${accountId}/messages/search`;
-      params = { searchKey: req.query.q || 'loan', limit: 3 };
-    } else {
-      return res.json({ error: 'type must be attachmentinfo or search' });
-    }
-    const data = await zohoGet(url, params);
-    res.json({ url, params, raw: data });
-  } catch (e) {
-    res.json({ error: e.message, response: e.response?.data });
-  }
-});
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'zoho-mail-mcp', version: '1.4.1' }));
 
 app.post('/mcp', async (req, res) => {
   const { method, params, id } = req.body;
@@ -68,7 +48,7 @@ app.post('/mcp', async (req, res) => {
       return ok({
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'zoho-mail-mcp', version: '1.3.0' }
+        serverInfo: { name: 'zoho-mail-mcp', version: '1.4.1' }
       });
     }
 
@@ -96,7 +76,7 @@ app.post('/mcp', async (req, res) => {
             properties: {
               accountId: { type: 'string', description: 'Account ID from list_accounts' },
               folderId:  { type: 'string', description: 'Folder ID from list_folders' },
-              limit:     { type: 'number', description: 'Max emails to return (default 20)' },
+              limit:     { type: 'number', description: 'Max emails to return (default 20, max 200)' },
               start:     { type: 'number', description: 'Pagination start index (default 1)' }
             },
             required: ['accountId', 'folderId']
@@ -104,13 +84,15 @@ app.post('/mcp', async (req, res) => {
         },
         {
           name: 'search_emails',
-          description: 'Search emails across all folders',
+          description: 'Search emails across the entire mailbox. Supports Zoho structured search syntax (e.g. sender:foo@bar.com, subject:invoice). Use sweep:true to retrieve ALL matching emails across the full mailbox in one call (loops internally, up to 2000 results). Use start+limit for manual pagination.',
           inputSchema: {
             type: 'object',
             properties: {
               accountId: { type: 'string', description: 'Account ID from list_accounts' },
-              query:     { type: 'string', description: 'Search keyword or phrase' },
-              limit:     { type: 'number', description: 'Max results to return (default 20)' }
+              query:     { type: 'string', description: 'Search keyword or Zoho search expression (e.g. "sender:foo@bar.com subject:invoice")' },
+              limit:     { type: 'number', description: 'Max results per page (default 50, max 200)' },
+              start:     { type: 'number', description: 'Pagination offset, 1-indexed (default 1). Use with limit to page through results.' },
+              sweep:     { type: 'boolean', description: 'If true, automatically pages through ALL results and returns the complete set (up to 2000). Ignores start. Use for full-mailbox coverage.' }
             },
             required: ['accountId', 'query']
           }
@@ -122,7 +104,7 @@ app.post('/mcp', async (req, res) => {
             type: 'object',
             properties: {
               accountId: { type: 'string', description: 'Account ID from list_accounts' },
-              folderId:  { type: 'string', description: 'Folder ID the email lives in (from list_folders)' },
+              folderId:  { type: 'string', description: 'Folder ID the email lives in (from list_folders or search_emails result)' },
               messageId: { type: 'string', description: 'Message ID from list_emails or search_emails' }
             },
             required: ['accountId', 'folderId', 'messageId']
@@ -206,72 +188,119 @@ app.post('/mcp', async (req, res) => {
       }
 
       // ── search_emails ──────────────────────────────────────────────────────
-      // Zoho /messages/search requires ZohoMail.messages.ALL scope.
-      // If that returns 400, fall back to scanning all folders via /messages/view
-      // and client-side filtering by subject/from/summary.
+      // Uses Zoho's native /messages/search endpoint (true cross-folder search).
+      // Supports:
+      //   - Manual pagination via start + limit (limit max 200)
+      //   - Sweep mode: loops internally until all results are collected (cap 2000)
+      //   - Global date ordering via sortorder=desc
+      //   - Zoho structured search syntax in query (sender:, subject:, entire:, etc.)
       if (name === 'search_emails') {
-        let results = [];
-        let searchWorked = false;
-        try {
-          const data = await zohoGet(
-            `https://mail.zoho.com/api/accounts/${args.accountId}/messages/search`,
-            { searchKey: args.query, limit: args.limit || 20 }
-          );
-          const raw = data.data || data;
-          const list = Array.isArray(raw) ? raw : (raw ? [raw] : []);
-          results = list.map(m => ({
-            id:            m.messageId,
-            subject:       m.subject,
-            from:          m.fromAddress,
-            date:          m.receivedTime,
-            folderId:      m.folderId,
-            hasAttachment: m.hasAttachment,
-            summary:       m.summary
-          }));
-          searchWorked = true;
-        } catch (e) {
-          // /messages/search not available — fall back to folder scan
-        }
+        const SWEEP_CAP   = 2000;  // hard ceiling for sweep mode
+        const PAGE_SIZE   = 200;   // Zoho's per-call maximum
+        const userLimit   = Math.min(args.limit || 50, PAGE_SIZE);
+        const sweep       = args.sweep === true;
 
-        if (!searchWorked) {
-          // Fallback: fetch inbox + sent, filter client-side
-          const foldersData = await zohoGet(`https://mail.zoho.com/api/accounts/${args.accountId}/folders`);
-          const folders = (foldersData.data || []);
-          const q = (args.query || '').toLowerCase();
-          const limit = args.limit || 20;
-          for (const folder of folders) {
-            if (results.length >= limit) break;
-            try {
-              const fd = await zohoGet(
-                `https://mail.zoho.com/api/accounts/${args.accountId}/messages/view`,
-                { folderId: folder.folderId, limit: 50 }
-              );
-              const msgs = fd.data || [];
-              for (const m of msgs) {
-                if (results.length >= limit) break;
-                const haystack = `${m.subject||''} ${m.fromAddress||''} ${m.summary||''}`.toLowerCase();
-                if (haystack.includes(q)) {
-                  results.push({
-                    id:            m.messageId,
-                    subject:       m.subject,
-                    from:          m.fromAddress,
-                    date:          m.receivedTime,
-                    folderId:      m.folderId,
-                    hasAttachment: m.hasAttachment,
-                    summary:       m.summary
-                  });
-                }
-              }
-            } catch (_) { /* skip inaccessible folders */ }
-          }
-        }
+  // B1 fix: Zoho field name varies by region — use fallback chain
+  // B3 fix (Q3): surface `to` field since includeto:true is passed
+  const mapMsg = m => ({
+    id:            m.messageId,
+    subject:       m.subject,
+    from:          m.fromAddress,
+    to:            m.toAddress,
+    date:          m.receivedtime ?? m.receivedTime ?? m.sentDateInGMT,
+    folderId:      m.folderId,
+    hasAttachment: m.hasAttachment,
+    summary:       m.summary
+  });
 
-        return ok({ content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] });
+        const baseParams = {
+          searchKey:  args.query,
+          sortorder:  'desc',
+          includeto:  'true'
+        };
+
+  if (!sweep) {
+    // ── Single-page mode ──────────────────────────────────────────────
+    const data = await zohoGet(
+      `https://mail.zoho.com/api/accounts/${args.accountId}/messages/search`,
+      { ...baseParams, start: args.start || 1, limit: userLimit }
+    );
+    const raw  = data.data || data;
+    const list = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+    const mapped = list.map(mapMsg);
+    // B2 fix: client-side sort for deterministic ordering regardless of Zoho sortorder support
+    mapped.sort((a, b) => Number(b.date) - Number(a.date));
+    // Q2 fix: unified envelope shape for both modes
+    const truncated = list.length >= userLimit;
+    return ok({ content: [{ type: 'text', text: JSON.stringify({ total: mapped.length, truncated, results: mapped }, null, 2) }] });
+  }
+
+  // ── Sweep mode: page through entire mailbox ───────────────────────
+  let allResults = [];
+  let cursor     = 1;
+  let truncated  = false;
+
+  // S1 fix: 429 retry helper for sweep — returns partial results on unrecoverable error
+  const searchPage = async (start) => {
+    const MAX_RETRIES = 3;
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        return await zohoGet(
+          `https://mail.zoho.com/api/accounts/${args.accountId}/messages/search`,
+          { ...baseParams, start, limit: PAGE_SIZE }
+        );
+      } catch (e) {
+        const status = e.response?.status;
+        if (status === 429 && attempt < MAX_RETRIES - 1) {
+          // Exponential backoff: 1s, 2s, 4s
+          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        } else {
+          throw e;  // non-429 or exhausted retries — propagate
+        }
+      }
+    }
+  };
+
+  try {
+    while (true) {
+      const data = await searchPage(cursor);
+      const raw  = data.data || data;
+      const page = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+
+      if (page.length === 0) break;  // no more results
+
+      allResults = allResults.concat(page.map(mapMsg));
+      cursor += PAGE_SIZE;
+
+      // S2 fix: only set truncated if we actually cut results (not at exact cap)
+      if (allResults.length > SWEEP_CAP) {
+        truncated = true;
+        allResults = allResults.slice(0, SWEEP_CAP);
+        break;
+      }
+
+      if (page.length < PAGE_SIZE) break;  // last partial page
+    }
+  } catch (sweepErr) {
+    // S1 fix: mid-sweep failure returns partial results with error flag
+    if (allResults.length > 0) {
+      const partial = { total: allResults.length, truncated: true, partial_error: sweepErr.message, results: allResults };
+      // B2 fix: sort even partial results
+      partial.results.sort((a, b) => Number(b.date) - Number(a.date));
+      return ok({ content: [{ type: 'text', text: JSON.stringify(partial, null, 2) }] });
+    }
+    throw sweepErr;  // nothing collected — let outer catch handle it
+  }
+
+  // B2 fix: client-side global date sort for deterministic ordering
+  allResults.sort((a, b) => Number(b.date) - Number(a.date));
+
+  const response = { total: allResults.length, truncated, results: allResults };
+  return ok({ content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] });
       }
 
       // ── get_email ──────────────────────────────────────────────────────────
-      // FIX: correct endpoint requires folderId in the path
-      // Correct: /api/accounts/{accountId}/folders/{folderId}/messages/{messageId}/content
+      // Correct endpoint: /api/accounts/{accountId}/folders/{folderId}/messages/{messageId}/content
       if (name === 'get_email') {
         if (!args.folderId) {
           return err(-32602, 'folderId is required. Get it from list_folders or from the folderId field in list_emails/search_emails results.');
@@ -285,11 +314,9 @@ app.post('/mcp', async (req, res) => {
           return err(-32000, `Could not fetch email: ${e.response ? 'Zoho ' + e.response.status + ':' + JSON.stringify(e.response.data) : e.message}`);
         }
 
-        // Strip HTML tags from content for cleaner AI reading, keep plain text fallback
         const raw = data.data || data;
         let bodyText = '';
         if (raw.content) {
-          // Remove HTML tags
           bodyText = raw.content.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
         }
 
@@ -297,7 +324,7 @@ app.post('/mcp', async (req, res) => {
           messageId: raw.messageId,
           subject:   raw.subject,
           from:      raw.fromAddress || raw.from,
-          to:        raw.toAddress || raw.to,
+          to:        raw.toAddress   || raw.to,
           date:      raw.receivedTime || raw.date,
           body:      bodyText || JSON.stringify(raw)
         };
@@ -305,8 +332,7 @@ app.post('/mcp', async (req, res) => {
       }
 
       // ── list_attachments ───────────────────────────────────────────────────
-      // FIX: correct endpoint requires folderId in the path
-      // Correct: /api/accounts/{accountId}/folders/{folderId}/messages/{messageId}/attachmentinfo
+      // Correct endpoint: /api/accounts/{accountId}/folders/{folderId}/messages/{messageId}/attachmentinfo
       if (name === 'list_attachments') {
         if (!args.folderId) {
           return err(-32602, 'folderId is required. Get it from list_folders or from the folderId field in list_emails/search_emails results.');
@@ -333,8 +359,7 @@ app.post('/mcp', async (req, res) => {
       }
 
       // ── get_attachment ─────────────────────────────────────────────────────
-      // FIX: correct endpoint requires folderId in the path
-      // Correct: /api/accounts/{accountId}/folders/{folderId}/messages/{messageId}/attachments/{attachmentId}
+      // Correct endpoint: /api/accounts/{accountId}/folders/{folderId}/messages/{messageId}/attachments/{attachmentId}
       if (name === 'get_attachment') {
         if (!args.folderId) {
           return err(-32602, 'folderId is required. Get it from list_folders or from the folderId field in list_emails/search_emails results.');
@@ -393,4 +418,4 @@ app.post('/mcp', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.3.0 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.4.1 running on port ${PORT}`));
