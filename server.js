@@ -213,10 +213,10 @@ app.post('/mcp', async (req, res) => {
     summary:       m.summary
   });
 
+        // Note: sortorder and includeto are NOT accepted by /messages/search (cause 400).
+        // Ordering is handled client-side (B2 fix). to field populated via toAddress if Zoho returns it.
         const baseParams = {
-          searchKey:  args.query,
-          sortorder:  'desc',
-          includeto:  'true'
+          searchKey: args.query
         };
 
   if (!sweep) {
