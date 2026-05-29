@@ -188,115 +188,76 @@ app.post('/mcp', async (req, res) => {
       }
 
       // ── search_emails ──────────────────────────────────────────────────────
-      // Uses Zoho's native /messages/search endpoint (true cross-folder search).
+      // Implementation: folder-loop scan (Zoho /messages/search returns 400 for this account).
+      // Fetches up to MSGS_PER_FOLDER messages from every folder, filters client-side by keyword.
       // Supports:
-      //   - Manual pagination via start + limit (limit max 200)
-      //   - Sweep mode: loops internally until all results are collected (cap 2000)
-      //   - Global date ordering via sortorder=desc
-      //   - Zoho structured search syntax in query (sender:, subject:, entire:, etc.)
+      //   - limit: max results to return (default 50, max 200 per single call)
+      //   - sweep: true = scan ALL folders with up to SWEEP_CAP total results
+      //   - start: 1-indexed offset for single-page pagination (non-sweep mode only)
+      //   - Results sorted newest-first by date
       if (name === 'search_emails') {
-        const SWEEP_CAP   = 2000;  // hard ceiling for sweep mode
-        const PAGE_SIZE   = 200;   // Zoho's per-call maximum
-        const userLimit   = Math.min(args.limit || 50, PAGE_SIZE);
-        const sweep       = args.sweep === true;
+        const SWEEP_CAP       = 2000;  // hard ceiling for sweep mode
+        const MSGS_PER_FOLDER = 200;   // messages fetched per folder per pass
+        const userLimit       = Math.min(args.limit || 50, 200);
+        const sweep           = args.sweep === true;
+        const startOffset     = Math.max((args.start || 1) - 1, 0);  // convert 1-indexed to 0-indexed
+        const q               = (args.query || '').toLowerCase();
 
-  // B1 fix: Zoho field name varies by region — use fallback chain
-  // B3 fix (Q3): surface `to` field since includeto:true is passed
-  const mapMsg = m => ({
-    id:            m.messageId,
-    subject:       m.subject,
-    from:          m.fromAddress,
-    to:            m.toAddress,
-    date:          m.receivedtime ?? m.receivedTime ?? m.sentDateInGMT,
-    folderId:      m.folderId,
-    hasAttachment: m.hasAttachment,
-    summary:       m.summary
-  });
+        // Map a raw Zoho message object to our standard envelope
+        const mapMsg = m => ({
+          id:            m.messageId,
+          subject:       m.subject,
+          from:          m.fromAddress,
+          to:            m.toAddress,
+          date:          m.receivedtime ?? m.receivedTime ?? m.sentDateInGMT,
+          folderId:      m.folderId,
+          hasAttachment: m.hasAttachment,
+          summary:       m.summary
+        });
 
-        // Note: sortorder and includeto are NOT accepted by /messages/search (cause 400).
-        // Ordering is handled client-side (B2 fix). to field populated via toAddress if Zoho returns it.
-        const baseParams = {
-          searchKey: args.query
-        };
+        // Get all folders
+        const foldersData = await zohoGet(`https://mail.zoho.com/api/accounts/${args.accountId}/folders`);
+        const folders = foldersData.data || [];
 
-  if (!sweep) {
-    // ── Single-page mode ──────────────────────────────────────────────
-    const data = await zohoGet(
-      `https://mail.zoho.com/api/accounts/${args.accountId}/messages/search`,
-      { ...baseParams, start: args.start || 1, limit: userLimit }
-    );
-    const raw  = data.data || data;
-    const list = Array.isArray(raw) ? raw : (raw ? [raw] : []);
-    const mapped = list.map(mapMsg);
-    // B2 fix: client-side sort for deterministic ordering regardless of Zoho sortorder support
-    mapped.sort((a, b) => Number(b.date) - Number(a.date));
-    // Q2 fix: unified envelope shape for both modes
-    const truncated = list.length >= userLimit;
-    return ok({ content: [{ type: 'text', text: JSON.stringify({ total: mapped.length, truncated, results: mapped }, null, 2) }] });
-  }
+        let allMatches = [];
+        const cap = sweep ? SWEEP_CAP : userLimit + startOffset + 200; // collect enough to paginate
 
-  // ── Sweep mode: page through entire mailbox ───────────────────────
-  let allResults = [];
-  let cursor     = 1;
-  let truncated  = false;
-
-  // S1 fix: 429 retry helper for sweep — returns partial results on unrecoverable error
-  const searchPage = async (start) => {
-    const MAX_RETRIES = 3;
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      try {
-        return await zohoGet(
-          `https://mail.zoho.com/api/accounts/${args.accountId}/messages/search`,
-          { ...baseParams, start, limit: PAGE_SIZE }
-        );
-      } catch (e) {
-        const status = e.response?.status;
-        if (status === 429 && attempt < MAX_RETRIES - 1) {
-          // Exponential backoff: 1s, 2s, 4s
-          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
-        } else {
-          throw e;  // non-429 or exhausted retries — propagate
+        for (const folder of folders) {
+          if (allMatches.length >= cap) break;
+          try {
+            const fd = await zohoGet(
+              `https://mail.zoho.com/api/accounts/${args.accountId}/messages/view`,
+              { folderId: folder.folderId, limit: MSGS_PER_FOLDER }
+            );
+            const msgs = fd.data || [];
+            for (const m of msgs) {
+              if (allMatches.length >= cap) break;
+              const haystack = `${m.subject||''} ${m.fromAddress||''} ${m.toAddress||''} ${m.summary||''}`.toLowerCase();
+              if (haystack.includes(q)) {
+                allMatches.push(mapMsg(m));
+              }
+            }
+          } catch (_) { /* skip inaccessible folders */ }
         }
-      }
-    }
-  };
 
-  try {
-    while (true) {
-      const data = await searchPage(cursor);
-      const raw  = data.data || data;
-      const page = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+        // Sort all matches newest-first
+        allMatches.sort((a, b) => Number(b.date) - Number(a.date));
 
-      if (page.length === 0) break;  // no more results
+        let truncated = false;
+        let results;
 
-      allResults = allResults.concat(page.map(mapMsg));
-      cursor += PAGE_SIZE;
+        if (sweep) {
+          // Sweep: return up to SWEEP_CAP, flag if cut
+          truncated = allMatches.length > SWEEP_CAP;
+          results = allMatches.slice(0, SWEEP_CAP);
+        } else {
+          // Single-page: apply start offset and limit
+          const page = allMatches.slice(startOffset, startOffset + userLimit);
+          truncated = allMatches.length > startOffset + userLimit;
+          results = page;
+        }
 
-      // S2 fix: only set truncated if we actually cut results (not at exact cap)
-      if (allResults.length > SWEEP_CAP) {
-        truncated = true;
-        allResults = allResults.slice(0, SWEEP_CAP);
-        break;
-      }
-
-      if (page.length < PAGE_SIZE) break;  // last partial page
-    }
-  } catch (sweepErr) {
-    // S1 fix: mid-sweep failure returns partial results with error flag
-    if (allResults.length > 0) {
-      const partial = { total: allResults.length, truncated: true, partial_error: sweepErr.message, results: allResults };
-      // B2 fix: sort even partial results
-      partial.results.sort((a, b) => Number(b.date) - Number(a.date));
-      return ok({ content: [{ type: 'text', text: JSON.stringify(partial, null, 2) }] });
-    }
-    throw sweepErr;  // nothing collected — let outer catch handle it
-  }
-
-  // B2 fix: client-side global date sort for deterministic ordering
-  allResults.sort((a, b) => Number(b.date) - Number(a.date));
-
-  const response = { total: allResults.length, truncated, results: allResults };
-  return ok({ content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] });
+        return ok({ content: [{ type: 'text', text: JSON.stringify({ total: results.length, truncated, results }, null, 2) }] });
       }
 
       // ── get_email ──────────────────────────────────────────────────────────
