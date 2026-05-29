@@ -36,7 +36,7 @@ async function zohoGet(url, params = {}) {
   return res.data;
 }
 
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'zoho-mail-mcp', version: '1.5.0' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'zoho-mail-mcp', version: '1.5.1' }));
 
 app.post('/mcp', async (req, res) => {
   const { method, params, id } = req.body;
@@ -48,7 +48,7 @@ app.post('/mcp', async (req, res) => {
       return ok({
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'zoho-mail-mcp', version: '1.5.0' }
+        serverInfo: { name: 'zoho-mail-mcp', version: '1.5.1' }
       });
     }
 
@@ -242,14 +242,19 @@ app.post('/mcp', async (req, res) => {
 
         try {
           if (!sweep) {
-            // Single-page native search
+            // Single-page native search.
+            // NOTE: Zoho ignores the limit param and always returns up to 200 results.
+            // We slice client-side to honour the user's requested limit.
+            // The start param works correctly in 200-item increments.
             const data = await nativePage(args.start || 1);
             const raw  = data.data || data;
             const list = Array.isArray(raw) ? raw : (raw ? [raw] : []);
             const mapped = list.map(mapMsg);
             mapped.sort((a, b) => Number(b.date) - Number(a.date));
-            truncated = list.length >= userLimit;
-            return ok({ content: [{ type: 'text', text: JSON.stringify({ total: mapped.length, truncated, results: mapped, source: 'native' }, null, 2) }] });
+            // Client-side slice to requested limit
+            const sliced   = mapped.slice(0, userLimit);
+            truncated = list.length > userLimit;
+            return ok({ content: [{ type: 'text', text: JSON.stringify({ total: sliced.length, truncated, results: sliced, source: 'native' }, null, 2) }] });
           }
 
           // Sweep: page through all native results
@@ -439,4 +444,4 @@ app.post('/mcp', async (req, res) => {
 
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.5.0 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Zoho Mail MCP server v1.5.1 running on port ${PORT}`));
